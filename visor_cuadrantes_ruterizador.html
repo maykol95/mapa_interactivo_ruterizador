@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visor PDV • Agrupar y Filtrar</title>
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet.Geoman para dibujo -->
+  <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.14.0/dist/leaflet-geoman.css" />
+  <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.14.0/dist/leaflet-geoman.min.js"></script>
+
+  <!-- Turf.js -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <!-- SheetJS -->
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <style>
+    :root{--sidebar-w:300px}
+    html, body { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+    #app { display: grid; grid-template-rows: auto auto 1fr; height: 100%; }
+    header { padding: 8px 12px; border-bottom: 1px solid #ccc; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .filters { padding: 6px 12px; border-bottom: 1px solid #ccc; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    #main { display:grid; grid-template-columns: var(--sidebar-w) 1fr; height:100%; }
+    #sidebar { border-right:1px solid #ccc; padding:10px; overflow:auto; }
+    #map { height: 100%; }
+    .btn { padding: 5px 8px; border: 1px solid #ccc; background: #eee; border-radius: 4px; cursor: pointer; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #selection-count { font-weight: bold; color: #2563eb; }
+    h3 { margin:8px 0 6px; font-size:14px; }
+    .small { font-size:12px; color:#555; }
+    .legend-list { display:flex; flex-direction:column; gap:6px; }
+    .legend-row { display:flex; align-items:center; gap:8px; justify-content:space-between; border:1px solid #e5e7eb; border-radius:6px; padding:6px; }
+    .legend-label { font-size:12px; flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .legend-color { width:28px; height:28px; border:1px solid #666; border-radius:6px; padding:0; cursor:pointer; }
+    .multiline { white-space: pre-line; }
+    select, input[type="color"] { font-size:12px; }
+    .row { display:flex; align-items:center; gap:8px; margin:4px 0; }
+    .w-100 { width:100%; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <label>Cargar Excel <input id="file-input" type="file" accept=".xlsx,.xls"></label>
+    <button id="export-btn" class="btn" disabled>Exportar Excel</button>
+    <span id="selection-count">Seleccionados: 0</span>
+    <span id="visible-count" class="small">Visibles: 0</span>
+  </header>
+
+  <div class="filters" id="filters"></div>
+
+  <div id="main">
+    <aside id="sidebar">
+      <h3>Filtro de cuadrantes (multi)</h3>
+      <div class="row">
+        <button id="q-sel-all" class="btn">Seleccionar todos</button>
+        <button id="q-clear" class="btn">Limpiar</button>
+      </div>
+      <select id="filter-cuadrante" class="w-100" multiple size="8"></select>
+      <div class="small">Tip: Ctrl/Shift para selección múltiple</div>
+
+      <h3 style="margin-top:14px">Columna para colores</h3>
+      <select id="legend-col" class="w-100"></select>
+
+      <h3 style="margin-top:14px">Colores por valor</h3>
+      <div id="legend-list" class="legend-list"></div>
+    </aside>
+
+    <div id="map"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ===== Estado =====
+  let workbook, sheetName, rows = [], markers = [], map, layerGroup;
+  let headers=[]; let latKey='LATITUD', lonKey='LONGITUD';
+  let colorMap={};
+  const NO_Q='__SIN__';
+  const NO_Q_LABEL='Sin cuadrante';
+
+  const COLS = { lat:["LATITUD","LAT","Latitud","lat"], lon:["LONGITUD","LON","Longitud","lon"], cuadrante:["CUADRANTE","Cuadrante","cuadrante"] };
+
+  // ===== Util =====
+  function findHeader(cands){ return headers.find(h => cands.map(c=>c.toLowerCase()).includes(h.toLowerCase())); }
+  function ensureColor(v, i=0){ if(!colorMap[v]){ const hue=(i*60)%360; colorMap[v]=`hsl(${hue},70%,45%)`; } }
+  function getColor(v){ return colorMap[v] || (v===NO_Q ? '#9ca3af' : '#9ca3af'); }
+  function rgbToHexAny(color){ const ctx=document.createElement('canvas').getContext('2d'); ctx.fillStyle=color; return ctx.fillStyle; }
+  function updateVisibleCount(){ document.getElementById('visible-count').textContent = 'Visibles: ' + markers.length; }
+
+  // ===== Filtros base (Sub Canal / Dep / Prov / Dist) =====
+  function passesFilters(r){
+    const selects=document.querySelectorAll('.filters select');
+    for (const sel of selects){ if(sel.value && r[sel.dataset.col]!=sel.value) return false; }
+    return true;
+  }
+  function buildFilters(){
+    const filterDiv=document.getElementById('filters');
+    filterDiv.innerHTML='';
+    const filterCols=["Sub Canal","Departamento","Provincia","Distrito"];
+    for (const col of filterCols){
+      if(!headers.includes(col)) continue;
+      const values=[...new Set(rows.map(r=>r[col]))].filter(v=>v!==undefined && v!==null && String(v).trim()!=='');
+      const sel=document.createElement('select');
+      sel.dataset.col=col;
+      const opt=document.createElement('option'); opt.value=''; opt.textContent=col+': Todos'; sel.appendChild(opt);
+      values.forEach(v=>{let o=document.createElement('option');o.value=v;o.textContent=v;sel.appendChild(o);});
+      sel.addEventListener('change',()=> redraw());
+      filterDiv.appendChild(sel);
+    }
+  }
+
+  // ===== Leyenda y colores (en sidebar) =====
+  function buildLegendSelector(){
+    const sel=document.getElementById('legend-col');
+    sel.innerHTML='';
+    headers.forEach(h=>{ let o=document.createElement('option'); o.value=h; o.textContent=h; sel.appendChild(o); });
+    // por defecto usa CUADRANTE si existe
+    const def = findHeader(COLS.cuadrante) || headers[0];
+    sel.value = def;
+    sel.onchange=()=> redraw();
+  }
+
+  function buildLegendList(values){
+    const cont=document.getElementById('legend-list');
+    cont.innerHTML='';
+    values.forEach((v,i)=>{
+      ensureColor(v,i);
+      const row=document.createElement('div'); row.className='legend-row';
+      const lab=document.createElement('span'); lab.className='legend-label'; lab.textContent=(v===NO_Q?NO_Q_LABEL:String(v));
+      const cp=document.createElement('input'); cp.type='color'; cp.className='legend-color'; cp.value=rgbToHexAny(getColor(v));
+      cp.oninput=()=>{ colorMap[v]=cp.value; redraw(); };
+      row.appendChild(lab); row.appendChild(cp); cont.appendChild(row);
+    });
+  }
+
+  // ===== Filtro de cuadrantes (multi) =====
+  function buildCuadranteFilter(){
+    const sel=document.getElementById('filter-cuadrante');
+    const qVals = new Set();
+    rows.forEach(r=>{
+      const raw = r[ findHeader(COLS.cuadrante) || 'CUADRANTE' ];
+      const v = (raw!==undefined && raw!==null && String(raw).trim()!=='') ? raw : NO_Q;
+      qVals.add(v);
+    });
+    const arr=[...qVals].sort((a,b)=> (a===NO_Q? -1 : b===NO_Q? 1 : (''+a).localeCompare(''+b)));
+    sel.innerHTML='';
+    arr.forEach(v=>{ const opt=document.createElement('option'); opt.value=v; opt.textContent=(v===NO_Q?NO_Q_LABEL:String(v)); sel.appendChild(opt); });
+
+    document.getElementById('q-sel-all').onclick = ()=>{ for(const o of sel.options) o.selected=true; redraw(); };
+    document.getElementById('q-clear').onclick = ()=>{ for(const o of sel.options) o.selected=false; redraw(); };
+
+    sel.onchange=()=> redraw();
+  }
+
+  function getSelectedQuadrantes(){
+    const sel=document.getElementById('filter-cuadrante');
+    const selVals=[...sel.options].filter(o=>o.selected).map(o=>o.value);
+    return new Set(selVals); // si size=0 => no filtra (todos)
+  }
+
+  // ===== Dibujo y asignación =====
+  function initMap(){
+    map=L.map('map').setView([-12.0464,-77.0428],6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+    layerGroup=L.layerGroup().addTo(map);
+
+    map.pm.addControls({ position:'topleft', drawMarker:false, drawCircle:false, drawPolyline:false });
+
+    map.on('pm:create', e=>{
+      if(e.layer instanceof L.Polygon){
+        const coords=e.layer.getLatLngs()[0].map(ll=>[ll.lng,ll.lat]); coords.push(coords[0]);
+        const poly=turf.polygon([coords]);
+        let count=0;
+        markers.forEach(m=>{ const r=rows[m.__idx]; const pt=turf.point([Number(r[lonKey]),Number(r[latKey])]); if(turf.booleanPointInPolygon(pt,poly)) count++; });
+        document.getElementById('selection-count').textContent='Seleccionados: '+count;
+        const q=prompt('Valor de CUADRANTE? ('+count+' puntos)');
+        if(!q){ e.layer.remove(); return; }
+        rows.forEach((r,idx)=>{
+          const lat=Number(r[latKey]); const lon=Number(r[lonKey]); if(!isFinite(lat)||!isFinite(lon)) return;
+          const pt=turf.point([lon,lat]);
+          if(turf.booleanPointInPolygon(pt,poly)) r['CUADRANTE']=q; // escribe/crea la columna
+        });
+        e.layer.remove();
+        // tras asignar, reconstruir filtros de cuadrante y redibujar
+        buildCuadranteFilter();
+        redraw();
+      }
+    });
+  }
+
+  // ===== Dibujo de marcadores =====
+  function drawMarkers(){
+    if(!latKey || !lonKey) return;
+    if(layerGroup) layerGroup.clearLayers();
+    markers=[];
+
+    const legendKey = document.getElementById('legend-col').value || (findHeader(COLS.cuadrante) || headers[0]);
+    const selectedQ = getSelectedQuadrantes();
+
+    // valores únicos para leyenda (considera NO_Q cuando vaya en blanco)
+    const visibleRows = rows.filter(r=>{
+      if(!passesFilters(r)) return false;
+      // filtro por cuadrante multi
+      const rawQ = r[ findHeader(COLS.cuadrante) || 'CUADRANTE' ];
+      const qVal = (rawQ!==undefined && rawQ!==null && String(rawQ).trim()!=='') ? rawQ : NO_Q;
+      if(selectedQ.size>0 && !selectedQ.has(String(qVal))) return false;
+      return true;
+    });
+
+    const legendVals=[...new Set(visibleRows.map(r=>{ const v=r[legendKey]; return (v!==undefined && v!==null && String(v).trim()!=='')? v : NO_Q; }))];
+    legendVals.forEach((v,i)=> ensureColor(v,i));
+    buildLegendList(legendVals);
+
+    const bounds=[];
+    for (let i=0;i<rows.length;i++){
+      const r=rows[i];
+      if(!passesFilters(r)) continue;
+      // aplica filtro de cuadrante multi
+      const rawQ = r[ findHeader(COLS.cuadrante) || 'CUADRANTE' ];
+      const qVal = (rawQ!==undefined && rawQ!==null && String(rawQ).trim()!=='') ? rawQ : NO_Q;
+      if(selectedQ.size>0 && !selectedQ.has(String(qVal))) continue;
+
+      const lat=Number(r[latKey]); const lon=Number(r[lonKey]); if(!isFinite(lat)||!isFinite(lon)) continue;
+      const val=r[legendKey]; const legendVal = (val!==undefined && val!==null && String(val).trim()!=='')? val : NO_Q;
+      const color=getColor(legendVal);
+      const m=L.circleMarker([lat,lon],{radius:5,color,weight:1,fillOpacity:.85}).addTo(layerGroup);
+      m.__idx=i;
+      const dispLegend = (legendVal===NO_Q?NO_Q_LABEL:legendVal);
+      m.bindTooltip(`${r["Nombre Livetrade"]||''}<br>${lat.toFixed(6)}, ${lon.toFixed(6)}<br>${legendKey}: ${dispLegend}`);
+      markers.push(m); bounds.push([lat,lon]);
+    }
+    if(bounds.length) map.fitBounds(bounds, { padding:[24,24] });
+    updateVisibleCount();
+  }
+
+  function redraw(){
+    // re-calcular lat/lon keys por si acaso
+    latKey = findHeader(COLS.lat) || latKey; lonKey = findHeader(COLS.lon) || lonKey;
+    drawMarkers();
+  }
+
+  // ===== Export =====
+  function exportExcel(){
+    if(!workbook) return;
+    const ws=XLSX.utils.json_to_sheet(rows);
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,sheetName||'PDV');
+    XLSX.writeFile(wb,'PDV_con_CUADRANTE.xlsx');
+  }
+
+  // ===== Carga Excel =====
+  async function handleFile(file){
+    const data=await file.arrayBuffer();
+    workbook=XLSX.read(data,{type:'array'});
+    sheetName=workbook.SheetNames[0];
+    const ws=workbook.Sheets[sheetName];
+    rows=XLSX.utils.sheet_to_json(ws,{defval:''});
+    if(!rows.length){ alert('Excel vacío'); return; }
+    headers=Object.keys(rows[0]);
+    latKey = findHeader(COLS.lat) || 'LATITUD';
+    lonKey = findHeader(COLS.lon) || 'LONGITUD';
+
+    buildFilters();
+    buildLegendSelector();
+    buildCuadranteFilter();
+    document.getElementById('export-btn').disabled=false;
+    redraw();
+  }
+
+  // ===== Listeners =====
+  document.getElementById('file-input').addEventListener('change',ev=>{ const f=ev.target.files?.[0]; if(f) handleFile(f); });
+  document.getElementById('export-btn').addEventListener('click',exportExcel);
+
+  // init
+  initMap();
+})();
+</script>
+</body>
+</html>
