@@ -2,10 +2,6 @@
 
 Aplicación web para visualizar y agrupar **puntos de venta (PDVs) geolocalizados** en cuadrantes, exportar resultados a Excel y KMZ, y cargar archivos existentes para continuar el trabajo.
 
-## 🚀 Demo
-Disponible en GitHub Pages:  
-[https://tuusuario.github.io/visor-pdv/](https://tuusuario.github.io/visor-pdv/)
-
 ## 📂 Archivos
 - `index.html` → página de entrada que redirige al visor.  
 - `visor_pdv.html` → aplicación completa del visor PDV.  
