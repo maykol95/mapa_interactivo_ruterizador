@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visor PDV • Agrupar, Filtrar y KMZ</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Geoman (dibujo) -->
+  <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.14.0/dist/leaflet-geoman.css" />
+  <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@2.14.0/dist/leaflet-geoman.min.js"></script>
+
+  <!-- Turf -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <!-- SheetJS -->
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <!-- JSZip -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+  <!-- togeojson (UMD expone toGeoJSON) -->
+  <script src="https://cdn.jsdelivr.net/npm/@tmcw/togeojson@5.8.1/dist/togeojson.umd.min.js"></script>
+
+  <!-- Intro.js -->
+  <link rel="stylesheet" href="https://unpkg.com/intro.js/minified/introjs.min.css" />
+  <script src="https://unpkg.com/intro.js/minified/intro.min.js"></script>
+
+  <style>
+    html, body { height:100%; margin:0; font-family: Arial, sans-serif; }
+    #map { height:100%; margin-left:320px; }
+    #sidebar { position:fixed; top:0; left:0; bottom:0; width:320px; background:#111827; color:#f3f4f6; overflow:auto; padding:12px; box-sizing:border-box; }
+    h2 { margin:6px 0 12px; font-size:16px; }
+    h3 { margin:14px 0 6px; font-size:14px; }
+    .btn { padding:6px 10px; border-radius:8px; border:1px solid #374151; background:#1f2937; color:#f9fafb; cursor:pointer; }
+    .btn.primary { background:#2563eb; border-color:#2563eb; }
+    .legend-row, .q-item { display:flex; align-items:center; gap:8px; border:1px solid #374151; border-radius:8px; padding:6px; margin:6px 0; background:#0b1220; }
+    .legend-color, .q-color { width:22px; height:22px; border-radius:4px; border:1px solid #9ca3af; }
+    .q-item .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .icon { cursor:pointer; border:none; background:transparent; color:#f87171; font-size:16px; }
+    #help-btn { position:fixed; bottom:20px; right:20px; background:#2563eb; color:white; border:none; border-radius:50%; width:40px; height:40px; font-size:20px; cursor:pointer; }
+  </style>
+</head>
+<body>
+  <aside id="sidebar">
+    <h2>Visor PDV</h2>
+    <h3 data-intro="Carga tu archivo Excel con PDVs">Cargar datos</h3>
+    <input id="file-input" type="file" accept=".xlsx,.xls" data-intro="Sube aquí tu Excel con PDVs" />
+    <input id="kmz-input" type="file" accept=".kmz,.kml" data-intro="Sube aquí un archivo KMZ/KML con cuadrantes ya dibujados" />
+    <div>
+      <button id="export-excel-btn" class="btn" data-intro="Exporta un Excel con los cuadrantes asignados">Exportar Excel</button>
+      <button id="export-kmz-btn" class="btn primary" disabled data-intro="Exporta un KMZ con tus cuadrantes dibujados">Exportar KMZ</button>
+    </div>
+
+    <h3 data-intro="Filtra los PDVs por cuadrante">Filtro de cuadrantes</h3>
+    <select id="filter-cuadrante" multiple size="6"></select>
+
+    <h3 data-intro="Selecciona la columna para colorear los puntos">Columna para leyenda</h3>
+    <select id="legend-col"></select>
+
+    <h3 data-intro="Cambia los colores de los puntos">Colores por valor</h3>
+    <div id="legend-list"></div>
+
+    <h3 data-intro="Aquí verás tus cuadrantes dibujados">Cuadrantes (capas)</h3>
+    <div id="q-layers"></div>
+  </aside>
+
+  <div id="map" data-intro="Aquí dibuja polígonos para crear cuadrantes. Solo la herramienta de polígonos está habilitada."></div>
+
+  <button id="help-btn" title="Ver tutorial">❓</button>
+
+<script>
+(() => {
+  let workbook=null, sheetName=null, rows=[], headers=[];
+  let map, pointLayer, markers=[];
+  let latKey='LATITUD', lonKey='LONGITUD';
+  const NO_Q='__SIN__', NO_Q_LABEL='Sin cuadrante';
+  const COLS = { lat:["LATITUD","LAT"], lon:["LONGITUD","LON"], cuadrante:["CUADRANTE","Cuadrante","cuadrante"] };
+  let colorMap={}, quadrantMap={};
+
+  function findHeader(cands){ return headers.find(h=>cands.map(c=>c.toLowerCase()).includes(h.toLowerCase())); }
+  function ensureColor(v,i=0){ if(!colorMap[v]){ const hue=(i*60)%360; colorMap[v]=`hsl(${hue},70%,45%)`; } }
+  function getColor(v){ return colorMap[v]||'#9ca3af'; }
+  function randHexColor(){ return '#'+Array.from({length:3},()=>Math.floor(Math.random()*256).toString(16).padStart(2,'0')).join(''); }
+  function rgbToHexAny(color){ const ctx=document.createElement('canvas').getContext('2d'); ctx.fillStyle=color; return ctx.fillStyle; }
+
+  function updateExportKmzButton(){ document.getElementById('export-kmz-btn').disabled = Object.keys(quadrantMap).length===0; }
+
+  function initMap(){
+    const baseCalles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19});
+    const baseSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}');
+    const baseLight = L.tileLayer('https://cartodb-basemaps-a.global.ssl.fastly.net/light_all/{z}/{x}/{y}{r}.png',{attribution:"© Carto"});
+
+    map=L.map('map',{layers:[baseCalles]}).setView([-12.0464,-77.0428],6);
+    L.control.layers({"Calles":baseCalles,"Satélite":baseSat,"Claro":baseLight}).addTo(map);
+
+    pointLayer=L.layerGroup().addTo(map);
+
+    map.pm.addControls({
+      position:'topleft',
+      drawPolygon:true,
+      drawMarker:false,
+      drawPolyline:false,
+      drawRectangle:false,
+      drawCircle:false,
+      drawCircleMarker:false,
+      drawText:false,
+      editMode:false,
+      dragMode:false,
+      cutPolygon:false,
+      removalMode:false,
+      rotateMode:false
+    });
+
+    map.on('pm:create', e=>{
+      if(e.layer instanceof L.Polygon){
+        const latlngs=e.layer.getLatLngs()[0];
+        const ring=latlngs.map(ll=>[ll.lng,ll.lat]);
+        if(ring[0][0]!==ring[ring.length-1][0]||ring[0][1]!==ring[ring.length-1][1]) ring.push(ring[0]);
+        const name=prompt("Nombre del cuadrante:");
+        if(!name){ e.layer.remove(); return; }
+        rows.forEach(r=>{ const lat=+r[latKey],lon=+r[lonKey]; if(!isFinite(lat)||!isFinite(lon)) return; if(turf.booleanPointInPolygon(turf.point([lon,lat]),turf.polygon([ring]))) r["CUADRANTE"]=name; });
+        const color=quadrantMap[name]?.color||randHexColor();
+        const poly=L.polygon(latlngs,{color,fillColor:color,fillOpacity:0.35}).addTo(map);
+        if(!quadrantMap[name]) quadrantMap[name]={color, layers:[], rings:[]};
+        quadrantMap[name].layers.push(poly); quadrantMap[name].rings.push(ring);
+        e.layer.remove(); buildCuadranteFilter(); buildQuadrantLayersList(); redraw(); updateExportKmzButton();
+      }
+    });
+  }
+
+  function buildLegendSelector(){ const sel=document.getElementById('legend-col'); sel.innerHTML=''; headers.forEach(h=>{ const o=document.createElement('option'); o.value=h; o.textContent=h; sel.appendChild(o); }); const def=findHeader(COLS.cuadrante)||headers[0]; if(def) sel.value=def; sel.onchange=()=> redraw(); }
+  function buildLegendList(values){ const cont=document.getElementById('legend-list'); cont.innerHTML=''; values.forEach((v,i)=>{ ensureColor(v,i); const row=document.createElement('div'); row.className='legend-row'; const lab=document.createElement('span'); lab.textContent=(v===NO_Q?NO_Q_LABEL:v); lab.style.flex='1'; const cp=document.createElement('input'); cp.type='color'; cp.className='legend-color'; cp.value=rgbToHexAny(getColor(v)); cp.oninput=()=>{ colorMap[v]=cp.value; redraw(); }; row.appendChild(lab); row.appendChild(cp); cont.appendChild(row); }); }
+  function buildCuadranteFilter(){ const sel=document.getElementById('filter-cuadrante'); sel.innerHTML=''; const vals=new Set(rows.map(r=>r['CUADRANTE']||NO_Q)); [...vals].forEach(v=>{ const o=document.createElement('option'); o.value=v; o.textContent=(v===NO_Q?NO_Q_LABEL:v); sel.appendChild(o); }); sel.onchange=()=> redraw(); }
+  function getSelectedQuadrantes(){ const sel=document.getElementById('filter-cuadrante'); return new Set([...sel.options].filter(o=>o.selected).map(o=>o.value)); }
+
+  function drawMarkers(){ if(!headers.length) return; pointLayer.clearLayers(); markers=[]; const legendKey=document.getElementById('legend-col').value||headers[0]; const selectedQ=getSelectedQuadrantes(); const legendVals=[...new Set(rows.filter(r=>{ const q=r['CUADRANTE']||NO_Q; if(selectedQ.size>0&&!selectedQ.has(q)) return false; return true; }).map(r=>r[legendKey]||NO_Q))]; buildLegendList(legendVals); rows.forEach((r,i)=>{ const lat=+r[latKey], lon=+r[lonKey]; if(!isFinite(lat)||!isFinite(lon)) return; const q=r['CUADRANTE']||NO_Q; if(selectedQ.size>0 && !selectedQ.has(q)) return; const val=r[legendKey]||NO_Q; ensureColor(val); const m=L.circleMarker([lat,lon],{radius:5,color:getColor(val),fillOpacity:.85}).addTo(pointLayer); m.__idx=i; markers.push(m); }); }
+  function redraw(){ drawMarkers(); }
+
+  function buildQuadrantLayersList(){ const cont=document.getElementById('q-layers'); cont.innerHTML=''; Object.keys(quadrantMap).forEach(name=>{ const item=document.createElement('div'); item.className='q-item'; const chk=document.createElement('input'); chk.type='checkbox'; chk.checked=true; chk.onchange=()=> quadrantMap[name].layers.forEach(l=> chk.checked?l.addTo(map).bringToFront():map.removeLayer(l)); const sw=document.createElement('span'); sw.className='q-color'; sw.style.background=quadrantMap[name].color; const lab=document.createElement('span'); lab.className='name'; lab.textContent=name; const del=document.createElement('button'); del.className='icon'; del.textContent='🗑️'; del.onclick=()=>{ if(!confirm(`¿Eliminar cuadrante ${name}?`)) return; quadrantMap[name].layers.forEach(l=>map.removeLayer(l)); delete quadrantMap[name]; rows.forEach(r=>{ if(r['CUADRANTE']===name) r['CUADRANTE']=''; }); buildCuadranteFilter(); buildQuadrantLayersList(); redraw(); updateExportKmzButton(); }; item.appendChild(chk); item.appendChild(sw); item.appendChild(lab); item.appendChild(del); cont.appendChild(item); }); updateExportKmzButton(); }
+
+  async function handleKMZ(file){
+    const ext=file.name.split('.').pop().toLowerCase(); let kmlText='';
+    try{
+      if(ext==='kmz'){
+        try{ const ab=await file.arrayBuffer(); const zip=await JSZip.loadAsync(ab); const kmlFile=zip.file(/\.kml$/i)[0]; if(!kmlFile) throw new Error('KMZ sin KML interno'); kmlText=await kmlFile.async('string'); }
+        catch(err){ console.warn('KMZ inválido, intento como KML plano',err); kmlText=await file.text(); }
+      } else { kmlText=await file.text(); }
+    } catch(e){ alert('Error leyendo archivo: '+e.message); return; }
+    const xml=new DOMParser().parseFromString(kmlText,'text/xml'); const gj=toGeoJSON.kml(xml);
+    (gj.features||[]).forEach(feat=>{
+      if(!(feat.geometry && (feat.geometry.type==='Polygon'||feat.geometry.type==='MultiPolygon'))) return;
+      const name=(feat.properties&&feat.properties.name)||`Q${Object.keys(quadrantMap).length+1}`;
+      const color=quadrantMap[name]?.color||randHexColor();
+      if(!quadrantMap[name]) quadrantMap[name]={color, layers:[], rings:[]};
+      const polys=feat.geometry.type==='Polygon'?[feat.geometry.coordinates]:feat.geometry.coordinates;
+      polys.forEach(poly=>{
+        const outer=poly[0]; const latlngs=outer.map(([lon,lat])=>L.latLng(lat,lon));
+        const layer=L.polygon(latlngs,{color,fillColor:color,fillOpacity:0.35}).addTo(map).bringToFront();
+        quadrantMap[name].layers.push(layer);
+        let ring=outer.slice(); if(ring[0][0]!==ring[ring.length-1][0]||ring[0][1]!==ring[ring.length-1][1]) ring.push(ring[0]);
+        quadrantMap[name].rings.push(ring);
+      });
+    });
+    buildQuadrantLayersList(); assignQuadrantsToPointsFromPolys(); buildCuadranteFilter(); redraw(); updateExportKmzButton();
+  }
+
+  function assignQuadrantsToPointsFromPolys(){ Object.keys(quadrantMap).forEach(name=>{ quadrantMap[name].rings.forEach(ring=>{ const poly=turf.polygon([ring]); rows.forEach(r=>{ const lat=+r[latKey], lon=+r[lonKey]; if(!isFinite(lat)||!isFinite(lon)) return; if(turf.booleanPointInPolygon(turf.point([lon,lat]),poly)) r['CUADRANTE']=name; }); }); }); }
+
+  async function handleFile(file){ const data=await file.arrayBuffer(); workbook=XLSX.read(data,{type:'array'}); sheetName=workbook.SheetNames[0]; rows=XLSX.utils.sheet_to_json(workbook.Sheets[sheetName],{defval:''}); headers=Object.keys(rows[0]||{}); latKey=findHeader(COLS.lat)||latKey; lonKey=findHeader(COLS.lon)||lonKey; buildLegendSelector(); buildCuadranteFilter(); assignQuadrantsToPointsFromPolys(); drawMarkers(); }
+
+  document.getElementById('file-input').addEventListener('change',ev=>{const f=ev.target.files?.[0]; if(f) handleFile(f);});
+  document.getElementById('kmz-input').addEventListener('change',ev=>{const f=ev.target.files?.[0]; if(f) handleKMZ(f);});
+
+  document.getElementById('export-excel-btn').addEventListener('click',()=>{ if(!rows.length) return alert('Carga un Excel primero'); const ws=XLSX.utils.json_to_sheet(rows); const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,sheetName||'PDV'); XLSX.writeFile(wb,'PDV_con_CUADRANTE.xlsx'); });
+  document.getElementById('export-kmz-btn').addEventListener('click',()=>{ const dateStr=new Date().toISOString().slice(0,10); let kml=`<?xml version=\"1.0\"?><kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>`; Object.keys(quadrantMap).forEach(name=>{ kml+=`<Folder><name>${name}</name>`; quadrantMap[name].rings.forEach(ring=>{ const coords=ring.map(([lon,lat])=>`${lon},${lat},0`).join(' '); kml+=`<Placemark><name>${name}</name><Polygon><outerBoundaryIs><LinearRing><coordinates>${coords}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>`; }); kml+=`</Folder>`; }); kml+=`</Document></kml>`; const blob=new Blob([kml],{type:'application/vnd.google-earth.kmz'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`Cuadrantes_${dateStr}.kmz`; a.click(); });
+
+  function startTour(){ introJs().setOptions({ nextLabel:'Siguiente', prevLabel:'Atrás', doneLabel:'Listo' }).start(); }
+  if(!localStorage.getItem('tutorialVisto')){ startTour(); localStorage.setItem('tutorialVisto','1'); }
+  document.getElementById('help-btn').onclick=()=> startTour();
+
+  window.onbeforeunload=function(){ return 'Tienes trabajo sin guardar. ¿Seguro que quieres salir?'; };
+
+  initMap();
+})();
+</script>
+</body>
+</html>
